@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>HFD direct upload test</title>
+  <style>
+    body { font: 15px/1.4 system-ui, sans-serif; max-width: 720px; margin: 32px auto; }
+    label { display: block; margin: 12px 0 4px; }
+    input, select, button { font: inherit; }
+    input[type=text], select { width: 100%; padding: 6px 8px; }
+    button { margin-top: 16px; padding: 8px 14px; }
+    pre { background: #111; color: #eee; padding: 12px; overflow: auto; white-space: pre-wrap; }
+    .row { margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <h1>Direct upload test</h1>
+  <p>Talks only to <code>hfd-direct-*</code> webhooks. Does not call <code>hfdwebform</code>.</p>
+
+  <label>Existing Opportunity id</label>
+  <input id="opp" type="text" placeholder="6ab729c3c242097da" />
+
+  <label>Folder path inside the site drive</label>
+  <input id="folder" type="text" value="PlanVault/Opportunities/_direct-test" />
+
+  <label>Device count (quote only, no file)</label>
+  <select id="count">
+    <option>51-100</option>
+    <option>101-150</option>
+    <option>201-250</option>
+  </select>
+
+  <label>File</label>
+  <input id="file" type="file" />
+
+  <div class="row">
+    <button id="quote" type="button">1. Quote JSON only</button>
+    <button id="go" type="button">2. Upload file direct to SharePoint</button>
+  </div>
+  <pre id="log">Ready.</pre>
+
+  <script>
+    const API = 'https://api-68ddce4c5e6dcf9e0.bizioffice.com/webhook';
+    const logEl = document.getElementById('log');
+    const log = (m) => { logEl.textContent += '\n' + (typeof m === 'string' ? m : JSON.stringify(m, null, 2)); };
+
+    document.getElementById('quote').onclick = async () => {
+      log('POST hfd-direct-quote');
+      const t0 = performance.now();
+      const res = await fetch(API + '/hfd-direct-quote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceCount: document.getElementById('count').value,
+          systemType: 'Basic',
+          turnaround: 'Standard',
+          cadAvailability: 'false'
+        })
+      });
+      const text = await res.text();
+      log('status ' + res.status + ' in ' + Math.round(performance.now() - t0) + 'ms');
+      log(text.slice(0, 1500));
+    };
+
+    document.getElementById('go').onclick = async () => {
+      const file = document.getElementById('file').files[0];
+      const opportunityId = document.getElementById('opp').value.trim();
+      const folderPath = document.getElementById('folder').value.trim();
+      if (!file || !opportunityId) { log('Need an Opportunity id and a file.'); return; }
+      log('Requesting upload session for ' + file.name + ' (' + file.size + ' bytes)');
+      const sessRes = await fetch(API + '/hfd-direct-upload-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          opportunityId,
+          folderPath,
+          fileName: file.name,
+          mimeType: file.type || 'application/octet-stream',
+          documentType: 'pdf'
+        })
+      });
+      const sessText = await sessRes.text();
+      log('session status ' + sessRes.status);
+      log(sessText.slice(0, 800));
+      if (!sessRes.ok) return;
+      const sess = JSON.parse(sessText);
+      if (!sess.uploadUrl) { log('No uploadUrl'); return; }
+
+      const chunkSize = 320 * 1024;
+      let start = 0;
+      let item = null;
+      while (start < file.size) {
+        const end = Math.min(start + chunkSize, file.size) - 1;
+        const chunk = file.slice(start, end + 1);
+        log('PUT bytes ' + start + '-' + end + '/' + file.size);
+        const put = await fetch(sess.uploadUrl, {
+          method: 'PUT',
+          headers: {
+            'Content-Length': String(chunk.size),
+            'Content-Range': 'bytes ' + start + '-' + end + '/' + file.size
+          },
+          body: chunk
+        });
+        const putText = await put.text();
+        log('PUT ' + put.status + ' ' + putText.slice(0, 240));
+        if (put.status >= 400) return;
+        if (putText && putText.trim().startsWith('{')) {
+          try { item = JSON.parse(putText); } catch (e) {}
+        }
+        start = end + 1;
+      }
+      if (!item || !item.id) { log('Upload finished without a drive item id. CORS or empty body.'); return; }
+      log('Completing link for item ' + item.id);
+      const done = await fetch(API + '/hfd-direct-upload-complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          opportunityId,
+          itemId: item.id,
+          fileName: file.name,
+          field: sess.field || 'cPDFPlansLinks',
+          webUrl: item.webUrl || ''
+        })
+      });
+      log('complete ' + done.status);
+      log((await done.text()).slice(0, 1500));
+    };
+  </script>
+</body>
+</html>
